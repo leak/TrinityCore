@@ -98,7 +98,7 @@ void PacketLog::Initialize()
     }
 }
 
-void PacketLog::LogPacket(WorldPacket const& packet, Direction direction, boost::asio::ip::address const& addr, uint16 port)
+void PacketLog::LogPacket(WorldPacket const& packet, Direction direction, std::string const& addr, uint16 port)
 {
     std::lock_guard<std::mutex> lock(_logPacketLock);
 
@@ -109,16 +109,7 @@ void PacketLog::LogPacket(WorldPacket const& packet, Direction direction, boost:
 
     header.OptionalDataSize = sizeof(header.OptionalData);
     memset(header.OptionalData.SocketIPBytes, 0, sizeof(header.OptionalData.SocketIPBytes));
-    if (addr.is_v4())
-    {
-        auto bytes = addr.to_v4().to_bytes();
-        memcpy(header.OptionalData.SocketIPBytes, bytes.data(), bytes.size());
-    }
-    else if (addr.is_v6())
-    {
-        auto bytes = addr.to_v6().to_bytes();
-        memcpy(header.OptionalData.SocketIPBytes, bytes.data(), bytes.size());
-    }
+    memcpy(header.OptionalData.SocketIPBytes, addr.c_str(), addr.length());
 
     header.OptionalData.SocketPort = port;
     header.Length = packet.size() + sizeof(header.Opcode);

@@ -18,103 +18,107 @@
 #ifndef SocketMgr_h__
 #define SocketMgr_h__
 
-#include "AsyncAcceptor.h"
-#include "Config.h"
-#include "Errors.h"
-#include "NetworkThread.h"
-#include <boost/asio/ip/tcp.hpp>
-#include <memory>
-
-using boost::asio::ip::tcp;
+#include "uv.h"
 
 template<class SocketType>
 class SocketMgr
 {
+    std::thread _networkThread;
+
+    uv_loop_t* _loop;
+
+    std::mutex _loopGuard;
+
+    uv_tcp_t _listener;
+
 public:
-    virtual ~SocketMgr()
-    {
-        delete[] _threads;
-    }
+    virtual ~SocketMgr() { }
 
-    virtual bool StartNetwork(boost::asio::io_service& service, std::string const& bindIp, uint16 port)
+    virtual bool StartNetwork(std::string const& bindIp, uint16 port)
     {
-        _threadCount = sConfigMgr->GetIntDefault("Network.Threads", 1);
+        sockaddr_in listenAddr;
 
-        if (_threadCount <= 0)
+        uv_ip4_addr(bindIp.c_str(), port, &listenAddr);
+
+        uv_tcp_bind(&_listener, reinterpret_cast<const struct sockaddr*>(&listenAddr), 0);
+
+        _listener.data = static_cast<void*>(this);
+
+        int err = uv_listen(reinterpret_cast<uv_stream_t*>(&_listener), 128, &ListenCallback);
+
+        if (err > 0)
         {
-            TC_LOG_ERROR("misc", "Network.Threads is wrong in your config file");
+            TC_LOG_ERROR("network", "Error starting listener: %s", uv_strerror(err));
             return false;
         }
 
-        try
+        _networkThread = std::thread([this]()
         {
-            _acceptor = new AsyncAcceptor(service, bindIp, port);
-        }
-        catch (boost::system::system_error const& err)
-        {
-            TC_LOG_ERROR("network", "Exception caught in SocketMgr.StartNetwork (%s:%u): %s", bindIp.c_str(), port, err.what());
-            return false;
-        }
-
-        _threads = CreateThreads();
-
-        ASSERT(_threads);
-
-        for (int32 i = 0; i < _threadCount; ++i)
-            _threads[i].Start();
+            uv_run(this->_loop, UV_RUN_DEFAULT);
+        });
 
         return true;
     }
 
     virtual void StopNetwork()
     {
-        if (_threadCount != 0)
-            for (int32 i = 0; i < _threadCount; ++i)
-                _threads[i].Stop();
+        uv_stop(_loop);
 
-        Wait();
+        _networkThread.join();
     }
 
-    void Wait()
+    virtual void OnSocketOpen(uv_tcp_t* socket)
     {
-        if (_threadCount != 0)
-            for (int32 i = 0; i < _threadCount; ++i)
-                _threads[i].Wait();
+
     }
 
-    virtual void OnSocketOpen(tcp::socket&& sock)
+    int QueueWriteRequest(uv_write_t* req,
+        uv_stream_t* handle,
+        const uv_buf_t bufs[],
+        unsigned int nbufs,
+        uv_write_cb cb)
     {
-        size_t min = 0;
+        std::unique_lock<std::mutex> guard(_loopGuard);
 
-        for (int32 i = 1; i < _threadCount; ++i)
-            if (_threads[i].GetConnectionCount() < _threads[min].GetConnectionCount())
-                min = i;
-
-        try
-        {
-            std::shared_ptr<SocketType> newSocket = std::make_shared<SocketType>(std::move(sock));
-            newSocket->Start();
-
-            _threads[min].AddSocket(newSocket);
-        }
-        catch (boost::system::system_error const& err)
-        {
-            TC_LOG_WARN("network", "Failed to retrieve client's remote address %s", err.what());
-        }
+        return uv_write(req, handle, bufs, nbufs, cb);
     }
 
-    int32 GetNetworkThreadCount() const { return _threadCount; }
+private:
+    static void ListenCallback(uv_stream_t* listener, int status) {
+        auto socketMgr = static_cast<SocketMgr<SocketType>*>(listener->data);
+
+        if (status < 0)
+        {
+            TC_LOG_ERROR("network", "Error when accepting connection: %s", uv_strerror(status));
+            return;
+        }
+
+        uv_tcp_t *clientSocket = new uv_tcp_t();
+
+        uv_tcp_init(socketMgr->_loop, clientSocket);
+
+        if (uv_accept(listener, reinterpret_cast<uv_stream_t*>(clientSocket)) == 0)
+        {
+            SocketType* socket = new SocketType(clientSocket, socketMgr);
+
+            socketMgr->OnSocketOpen(clientSocket);
+
+            socket->Start();
+        }
+        else
+        {
+            uv_close(reinterpret_cast<uv_handle_t*>(clientSocket), nullptr);
+            delete clientSocket;
+        }
+    }
 
 protected:
-    SocketMgr() : _acceptor(nullptr), _threads(nullptr), _threadCount(1)
+    SocketMgr()
     {
+        _loop = uv_default_loop();
+
+        uv_tcp_init(_loop, &_listener);
     }
-
-    virtual NetworkThread<SocketType>* CreateThreads() const = 0;
-
-    AsyncAcceptor* _acceptor;
-    NetworkThread<SocketType>* _threads;
-    int32 _threadCount;
 };
 
 #endif // SocketMgr_h__

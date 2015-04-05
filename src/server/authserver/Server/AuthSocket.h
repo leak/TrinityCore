@@ -23,33 +23,24 @@
 #include "ByteBuffer.h"
 #include "Socket.h"
 #include "BigNumber.h"
-#include <memory>
-#include <boost/asio/ip/tcp.hpp>
-
-using boost::asio::ip::tcp;
+#include <uv.h>
 
 struct AuthHandler;
 
-class AuthSession : public Socket<AuthSession>
+class AuthSocket : public Socket<AuthSocket>
 {
 public:
     static std::unordered_map<uint8, AuthHandler> InitHandlers();
 
-    AuthSession(tcp::socket&& socket) : Socket(std::move(socket)),
-        _isAuthenticated(false), _build(0), _expversion(0), _accountSecurityLevel(SEC_PLAYER)
-    {
-        N.SetHexStr("894B645E89E1535BBDAD5B8B290650530801B18EBFBF5E8FAB3C82872A3E9BB7");
-        g.SetDword(7);
-    }
+    AuthSocket(uv_tcp_t* socket, SocketMgr<AuthSocket>* socketMgr);
 
-    void Start() override
-    {
-        AsyncRead();
-    }
+    AuthSocket(AuthSocket const& right) = delete;
+    AuthSocket& operator=(AuthSocket const& right) = delete;
 
-    void SendPacket(ByteBuffer& packet);
+    void Start() override;
 
-protected:
+    void SendPacket(ByteBuffer const& packet);
+
     void ReadHandler() override;
 
 private:
@@ -88,7 +79,7 @@ struct AuthHandler
 {
     uint32 status;
     size_t packetSize;
-    bool (AuthSession::*handler)();
+    bool (AuthSocket::*handler)();
 };
 
 #pragma pack(pop)

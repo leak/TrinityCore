@@ -19,13 +19,10 @@
 #define AuthSocketMgr_h__
 
 #include "SocketMgr.h"
-#include "AuthSession.h"
+#include "AuthSocket.h"
 
-void OnSocketAccept(tcp::socket&& sock);
-
-class AuthSocketMgr : public SocketMgr<AuthSession>
+class AuthSocketMgr : public SocketMgr<AuthSocket>
 {
-    typedef SocketMgr<AuthSession> BaseSocketMgr;
 
 public:
     static AuthSocketMgr& Instance()
@@ -34,28 +31,26 @@ public:
         return instance;
     }
 
-    bool StartNetwork(boost::asio::io_service& service, std::string const& bindIp, uint16 port) override
+    /// Start network, listen at address:port .
+    bool StartNetwork(std::string const& bindIp, uint16 port) override
     {
-        if (!BaseSocketMgr::StartNetwork(service, bindIp, port))
-            return false;
+        SocketMgr::StartNetwork(bindIp, port);
 
-        _acceptor->AsyncAcceptManaged(&OnSocketAccept);
         return true;
     }
 
-protected:
-    NetworkThread<AuthSession>* CreateThreads() const override
+    /// Stops listener
+    void StopNetwork() override
     {
-        return new NetworkThread<AuthSession>[1];
+        SocketMgr::StopNetwork();
     }
+
+    // void OnSocketOpen(uv_tcp_t* socket) override;
+
+    // AuthSocketMgr();
+
 };
 
 #define sAuthSocketMgr AuthSocketMgr::Instance()
-
-void OnSocketAccept(tcp::socket&& sock)
-{
-    sAuthSocketMgr.OnSocketOpen(std::forward<tcp::socket>(sock));
-}
-
 
 #endif // AuthSocketMgr_h__

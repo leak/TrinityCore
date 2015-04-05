@@ -16,7 +16,7 @@
 * with this program. If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "AuthSession.h"
+#include "AuthSocket.h"
 #include "Log.h"
 #include "AuthCodes.h"
 #include "Database/DatabaseEnv.h"
@@ -25,6 +25,7 @@
 #include "openssl/crypto.h"
 #include "Configuration/Config.h"
 #include "RealmList.h"
+#include <boost/asio/ip/tcp.hpp>
 #include <boost/lexical_cast.hpp>
 
 using boost::asio::ip::tcp;
@@ -121,27 +122,52 @@ enum class BufferSizes : uint32
 #define XFER_RESUME_SIZE 9
 #define XFER_CANCEL_SIZE 1
 
-std::unordered_map<uint8, AuthHandler> AuthSession::InitHandlers()
+std::unordered_map<uint8, AuthHandler> AuthSocket::InitHandlers()
 {
     std::unordered_map<uint8, AuthHandler> handlers;
 
-    handlers[AUTH_LOGON_CHALLENGE]     = { STATUS_CONNECTED, AUTH_LOGON_CHALLENGE_INITIAL_SIZE, &AuthSession::HandleLogonChallenge };
-    handlers[AUTH_LOGON_PROOF]         = { STATUS_CONNECTED, sizeof(AUTH_LOGON_PROOF_C),        &AuthSession::HandleLogonProof };
-    handlers[AUTH_RECONNECT_CHALLENGE] = { STATUS_CONNECTED, AUTH_LOGON_CHALLENGE_INITIAL_SIZE, &AuthSession::HandleReconnectChallenge };
-    handlers[AUTH_RECONNECT_PROOF]     = { STATUS_CONNECTED, sizeof(AUTH_RECONNECT_PROOF_C),    &AuthSession::HandleReconnectProof };
-    handlers[REALM_LIST]               = { STATUS_AUTHED,    REALM_LIST_PACKET_SIZE,            &AuthSession::HandleRealmList };
-    handlers[XFER_ACCEPT]              = { STATUS_AUTHED,    XFER_ACCEPT_SIZE,                  &AuthSession::HandleXferAccept };
-    handlers[XFER_RESUME]              = { STATUS_AUTHED,    XFER_RESUME_SIZE,                  &AuthSession::HandleXferResume };
-    handlers[XFER_CANCEL]              = { STATUS_AUTHED,    XFER_CANCEL_SIZE,                  &AuthSession::HandleXferCancel };
+    handlers[AUTH_LOGON_CHALLENGE]     = { STATUS_CONNECTED, AUTH_LOGON_CHALLENGE_INITIAL_SIZE, &AuthSocket::HandleLogonChallenge };
+    handlers[AUTH_LOGON_PROOF]         = { STATUS_CONNECTED, sizeof(AUTH_LOGON_PROOF_C),        &AuthSocket::HandleLogonProof };
+    handlers[AUTH_RECONNECT_CHALLENGE] = { STATUS_CONNECTED, AUTH_LOGON_CHALLENGE_INITIAL_SIZE, &AuthSocket::HandleReconnectChallenge };
+    handlers[AUTH_RECONNECT_PROOF]     = { STATUS_CONNECTED, sizeof(AUTH_RECONNECT_PROOF_C),    &AuthSocket::HandleReconnectProof };
+    handlers[REALM_LIST]               = { STATUS_AUTHED,    REALM_LIST_PACKET_SIZE,            &AuthSocket::HandleRealmList };
+    handlers[XFER_ACCEPT]              = { STATUS_AUTHED,    XFER_ACCEPT_SIZE,                  &AuthSocket::HandleXferAccept };
+    handlers[XFER_RESUME]              = { STATUS_AUTHED,    XFER_RESUME_SIZE,                  &AuthSocket::HandleXferResume };
+    handlers[XFER_CANCEL]              = { STATUS_AUTHED,    XFER_CANCEL_SIZE,                  &AuthSocket::HandleXferCancel };
 
     return handlers;
 }
 
-std::unordered_map<uint8, AuthHandler> const Handlers = AuthSession::InitHandlers();
+std::unordered_map<uint8, AuthHandler> const Handlers = AuthSocket::InitHandlers();
 
-void AuthSession::ReadHandler()
+AuthSocket::AuthSocket(uv_tcp_t* socket, SocketMgr<AuthSocket>* socketMgr) : Socket(socket, socketMgr), _isAuthenticated(false), _build(0), _expversion(0), _accountSecurityLevel(SEC_PLAYER)
+{
+    N.SetHexStr("894B645E89E1535BBDAD5B8B290650530801B18EBFBF5E8FAB3C82872A3E9BB7");
+    g.SetDword(7);
+}
+
+void AuthSocket::Start()
+{
+    AsyncRead();
+}
+
+void AuthSocket::SendPacket(ByteBuffer const& packet)
+{
+    if (!IsOpen())
+        return;
+
+    //std::unique_lock<std::mutex> guard(_writeLock);
+
+    MessageBuffer* buffer = new MessageBuffer(packet.size());
+    buffer->Write(packet.contents(), packet.size());
+
+    Socket::SendPacket(buffer);
+}
+
+void AuthSocket::ReadHandler()
 {
     MessageBuffer& packet = GetReadBuffer();
+
     while (packet.GetActiveSize())
     {
         uint8 cmd = packet.GetReadPointer()[0];
@@ -174,27 +200,9 @@ void AuthSession::ReadHandler()
 
         packet.ReadCompleted(size);
     }
-
-    AsyncRead();
 }
 
-void AuthSession::SendPacket(ByteBuffer& packet)
-{
-    if (!IsOpen())
-        return;
-
-    if (!packet.empty())
-    {
-        MessageBuffer buffer;
-        buffer.Write(packet.contents(), packet.size());
-
-        std::unique_lock<std::mutex> guard(_writeLock);
-
-        QueuePacket(std::move(buffer), guard);
-    }
-}
-
-bool AuthSession::HandleLogonChallenge()
+bool AuthSocket::HandleLogonChallenge()
 {
     sAuthLogonChallenge_C* challenge = reinterpret_cast<sAuthLogonChallenge_C*>(GetReadBuffer().GetReadPointer());
 
@@ -203,16 +211,16 @@ bool AuthSession::HandleLogonChallenge()
 
     ByteBuffer pkt;
 
-    _login.assign((const char*)challenge->I, challenge->I_len);
+    _login.assign(reinterpret_cast<const char*>(challenge->I), challenge->I_len);
     _build = challenge->build;
     _expversion = uint8(AuthHelper::IsPostBCAcceptedClientBuild(_build) ? POST_BC_EXP_FLAG : (AuthHelper::IsPreBCAcceptedClientBuild(_build) ? PRE_BC_EXP_FLAG : NO_VALID_EXP_FLAG));
-    _os = (const char*)challenge->os;
+    _os = reinterpret_cast<const char*>(challenge->os);
 
     if (_os.size() > 4)
         return false;
 
     // Restore string order as its byte order is reversed
-    std::reverse(_os.begin(), _os.end());
+    reverse(_os.begin(), _os.end());
 
     pkt << uint8(AUTH_LOGON_CHALLENGE);
     pkt << uint8(0x00);
@@ -220,7 +228,7 @@ bool AuthSession::HandleLogonChallenge()
     // Verify that this IP is not in the ip_banned table
     LoginDatabase.Execute(LoginDatabase.GetPreparedStatement(LOGIN_DEL_EXPIRED_IP_BANS));
 
-    std::string ipAddress = GetRemoteIpAddress().to_string();
+    std::string ipAddress = GetRemoteIpAddress();
     uint16 port = GetRemotePort();
 
     PreparedStatement* stmt = LoginDatabase.GetPreparedStatement(LOGIN_SEL_IP_BANNED);
@@ -410,7 +418,7 @@ bool AuthSession::HandleLogonChallenge()
 }
 
 // Logon Proof command handler
-bool AuthSession::HandleLogonProof()
+bool AuthSocket::HandleLogonProof()
 {
 
     TC_LOG_DEBUG("server.authserver", "Entering _HandleLogonProof");
@@ -503,7 +511,7 @@ bool AuthSession::HandleLogonProof()
     // Check if SRP6 results match (password is correct), else send an error
     if (!memcmp(M.AsByteArray(sha.GetLength()).get(), logonProof->M1, 20))
     {
-        TC_LOG_DEBUG("server.authserver", "'%s:%d' User '%s' successfully authenticated", GetRemoteIpAddress().to_string().c_str(), GetRemotePort(), _login.c_str());
+        TC_LOG_DEBUG("server.authserver", "'%s:%d' User '%s' successfully authenticated", GetRemoteIpAddress(), GetRemotePort(), _login.c_str());
 
         // Update the sessionkey, last_ip, last login time and reset number of failed logins in the account table for this account
         // No SQL injection (escaped user name) and IP address as received by socket
@@ -511,7 +519,7 @@ bool AuthSession::HandleLogonProof()
 
         PreparedStatement *stmt = LoginDatabase.GetPreparedStatement(LOGIN_UPD_LOGONPROOF);
         stmt->setString(0, K_hex);
-        stmt->setString(1, GetRemoteIpAddress().to_string().c_str());
+        stmt->setString(1, GetRemoteIpAddress());
         stmt->setUInt32(2, GetLocaleByName(_localizationName));
         stmt->setString(3, _os);
         stmt->setString(4, _login);
@@ -556,7 +564,7 @@ bool AuthSession::HandleLogonProof()
             proof.unk3 = 0;
 
             packet.resize(sizeof(proof));
-            std::memcpy(packet.contents(), &proof, sizeof(proof));
+            memcpy(packet.contents(), &proof, sizeof(proof));
         }
         else
         {
@@ -567,7 +575,7 @@ bool AuthSession::HandleLogonProof()
             proof.unk2 = 0x00;
 
             packet.resize(sizeof(proof));
-            std::memcpy(packet.contents(), &proof, sizeof(proof));
+            memcpy(packet.contents(), &proof, sizeof(proof));
         }
 
         SendPacket(packet);
@@ -583,7 +591,7 @@ bool AuthSession::HandleLogonProof()
         SendPacket(packet);
 
         TC_LOG_DEBUG("server.authserver", "'%s:%d' [AuthChallenge] account %s tried to login with invalid password!",
-            GetRemoteIpAddress().to_string().c_str(), GetRemotePort(), _login.c_str());
+            GetRemoteIpAddress(), GetRemotePort(), _login.c_str());
 
         uint32 MaxWrongPassCount = sConfigMgr->GetIntDefault("WrongPass.MaxCount", 0);
 
@@ -592,7 +600,7 @@ bool AuthSession::HandleLogonProof()
         {
             PreparedStatement* logstmt = LoginDatabase.GetPreparedStatement(LOGIN_INS_FALP_IP_LOGGING);
             logstmt->setString(0, _login);
-            logstmt->setString(1, GetRemoteIpAddress().to_string());
+            logstmt->setString(1, GetRemoteIpAddress());
             logstmt->setString(2, "Logged on failed AccountLogin due wrong password");
 
             LoginDatabase.Execute(logstmt);
@@ -626,17 +634,17 @@ bool AuthSession::HandleLogonProof()
                         LoginDatabase.Execute(stmt);
 
                         TC_LOG_DEBUG("server.authserver", "'%s:%d' [AuthChallenge] account %s got banned for '%u' seconds because it failed to authenticate '%u' times",
-                            GetRemoteIpAddress().to_string().c_str(), GetRemotePort(), _login.c_str(), WrongPassBanTime, failed_logins);
+                            GetRemoteIpAddress(), GetRemotePort(), _login.c_str(), WrongPassBanTime, failed_logins);
                     }
                     else
                     {
                         stmt = LoginDatabase.GetPreparedStatement(LOGIN_INS_IP_AUTO_BANNED);
-                        stmt->setString(0, GetRemoteIpAddress().to_string());
+                        stmt->setString(0, GetRemoteIpAddress());
                         stmt->setUInt32(1, WrongPassBanTime);
                         LoginDatabase.Execute(stmt);
 
                         TC_LOG_DEBUG("server.authserver", "'%s:%d' [AuthChallenge] IP got banned for '%u' seconds because account %s failed to authenticate '%u' times",
-                            GetRemoteIpAddress().to_string().c_str(), GetRemotePort(), WrongPassBanTime, _login.c_str(), failed_logins);
+                            GetRemoteIpAddress(), GetRemotePort(), WrongPassBanTime, _login.c_str(), failed_logins);
                     }
                 }
             }
@@ -646,7 +654,7 @@ bool AuthSession::HandleLogonProof()
     return true;
 }
 
-bool AuthSession::HandleReconnectChallenge()
+bool AuthSocket::HandleReconnectChallenge()
 {
     TC_LOG_DEBUG("server.authserver", "Entering _HandleReconnectChallenge");
     sAuthLogonChallenge_C* challenge = reinterpret_cast<sAuthLogonChallenge_C*>(GetReadBuffer().GetReadPointer());
@@ -654,7 +662,7 @@ bool AuthSession::HandleReconnectChallenge()
     //TC_LOG_DEBUG("server.authserver", "[AuthChallenge] got full packet, %#04x bytes", challenge->size);
     TC_LOG_DEBUG("server.authserver", "[AuthChallenge] name(%d): '%s'", challenge->I_len, challenge->I);
 
-    _login.assign((const char*)challenge->I, challenge->I_len);
+    _login.assign(reinterpret_cast<const char*>(challenge->I), challenge->I_len);
 
     PreparedStatement* stmt = LoginDatabase.GetPreparedStatement(LOGIN_SEL_SESSIONKEY);
     stmt->setString(0, _login);
@@ -664,20 +672,20 @@ bool AuthSession::HandleReconnectChallenge()
     if (!result)
     {
         TC_LOG_ERROR("server.authserver", "'%s:%d' [ERROR] user %s tried to login and we cannot find his session key in the database.",
-            GetRemoteIpAddress().to_string().c_str(), GetRemotePort(), _login.c_str());
+            GetRemoteIpAddress(), GetRemotePort(), _login.c_str());
         return false;
     }
 
     // Reinitialize build, expansion and the account securitylevel
     _build = challenge->build;
     _expversion = uint8(AuthHelper::IsPostBCAcceptedClientBuild(_build) ? POST_BC_EXP_FLAG : (AuthHelper::IsPreBCAcceptedClientBuild(_build) ? PRE_BC_EXP_FLAG : NO_VALID_EXP_FLAG));
-    _os = (const char*)challenge->os;
+    _os = reinterpret_cast<const char*>(challenge->os);
 
     if (_os.size() > 4)
         return false;
 
     // Restore string order as its byte order is reversed
-    std::reverse(_os.begin(), _os.end());
+    reverse(_os.begin(), _os.end());
 
     Field* fields = result->Fetch();
     uint8 secLevel = fields[2].GetUInt8();
@@ -697,7 +705,7 @@ bool AuthSession::HandleReconnectChallenge()
 
     return true;
 }
-bool AuthSession::HandleReconnectProof()
+bool AuthSocket::HandleReconnectProof()
 {
     TC_LOG_DEBUG("server.authserver", "Entering _HandleReconnectProof");
     sAuthReconnectProof_C *reconnectProof = reinterpret_cast<sAuthReconnectProof_C*>(GetReadBuffer().GetReadPointer());
@@ -727,7 +735,7 @@ bool AuthSession::HandleReconnectProof()
     }
     else
     {
-        TC_LOG_ERROR("server.authserver", "'%s:%d' [ERROR] user %s tried to login, but session is invalid.", GetRemoteIpAddress().to_string().c_str(),
+        TC_LOG_ERROR("server.authserver", "'%s:%d' [ERROR] user %s tried to login, but session is invalid.", GetRemoteIpAddress(),
             GetRemotePort(), _login.c_str());
         return false;
     }
@@ -768,7 +776,7 @@ tcp::endpoint const GetAddressForClient(Realm const& realm, ip::address const& c
     return endpoint;
 }
 
-bool AuthSession::HandleRealmList()
+bool AuthSocket::HandleRealmList()
 {
     TC_LOG_DEBUG("server.authserver", "Entering _HandleRealmList");
 
@@ -779,7 +787,7 @@ bool AuthSession::HandleRealmList()
     PreparedQueryResult result = LoginDatabase.Query(stmt);
     if (!result)
     {
-        TC_LOG_ERROR("server.authserver", "'%s:%d' [ERROR] user %s tried to login but we cannot find him in the database.", GetRemoteIpAddress().to_string().c_str(),
+        TC_LOG_ERROR("server.authserver", "'%s:%d' [ERROR] user %s tried to login but we cannot find him in the database.", GetRemoteIpAddress(),
             GetRemotePort(), _login.c_str());
         return false;
     }
@@ -837,7 +845,7 @@ bool AuthSession::HandleRealmList()
             pkt << lock;                                    // if 1, then realm locked
         pkt << uint8(flag);                                 // RealmFlags
         pkt << name;
-        pkt << boost::lexical_cast<std::string>(GetAddressForClient(realm, GetRemoteIpAddress()));
+        pkt << boost::lexical_cast<std::string>(GetAddressForClient(realm, ip::address::from_string(GetRemoteIpAddress())));
         pkt << realm.populationLevel;
         pkt << AmountOfCharacters;
         pkt << realm.timezone;                              // realm category
@@ -886,7 +894,7 @@ bool AuthSession::HandleRealmList()
 }
 
 // Resume patch transfer
-bool AuthSession::HandleXferResume()
+bool AuthSocket::HandleXferResume()
 {
     TC_LOG_DEBUG("server.authserver", "Entering _HandleXferResume");
     //uint8
@@ -895,7 +903,7 @@ bool AuthSession::HandleXferResume()
 }
 
 // Cancel patch transfer
-bool AuthSession::HandleXferCancel()
+bool AuthSocket::HandleXferCancel()
 {
     TC_LOG_DEBUG("server.authserver", "Entering _HandleXferCancel");
     //uint8
@@ -903,7 +911,7 @@ bool AuthSession::HandleXferCancel()
 }
 
 // Accept patch transfer
-bool AuthSession::HandleXferAccept()
+bool AuthSocket::HandleXferAccept()
 {
     TC_LOG_DEBUG("server.authserver", "Entering _HandleXferAccept");
     //uint8
@@ -911,7 +919,7 @@ bool AuthSession::HandleXferAccept()
 }
 
 // Make the SRP6 calculation from hash in dB
-void AuthSession::SetVSFields(const std::string& rI)
+void AuthSocket::SetVSFields(const std::string& rI)
 {
     s.SetRand(int32(BufferSizes::SRP_6_S) * 8);
 

@@ -23,14 +23,10 @@
 #include "AuthCrypt.h"
 #include "ServerPktHeader.h"
 #include "Socket.h"
-#include "Util.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
 #include <chrono>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/buffer.hpp>
-
-using boost::asio::ip::tcp;
+#include <uv.h>
 
 #pragma pack(push, 1)
 
@@ -48,7 +44,7 @@ struct ClientPktHeader
 class WorldSocket : public Socket<WorldSocket>
 {
 public:
-    WorldSocket(tcp::socket&& socket);
+    WorldSocket(uv_tcp_t* socket, SocketMgr<WorldSocket>* socketMgr);
 
     WorldSocket(WorldSocket const& right) = delete;
     WorldSocket& operator=(WorldSocket const& right) = delete;
@@ -57,9 +53,10 @@ public:
 
     void SendPacket(WorldPacket const& packet);
 
+    void ReadHandler() override;
+
 protected:
     void OnClose() override;
-    void ReadHandler() override;
     bool ReadHeaderHandler();
     bool ReadDataHandler();
 
@@ -87,6 +84,8 @@ private:
 
     MessageBuffer _headerBuffer;
     MessageBuffer _packetBuffer;
+
+    std::mutex _writeLock;
 };
 
 #endif

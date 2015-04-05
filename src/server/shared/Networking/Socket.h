@@ -19,133 +19,138 @@
 #define __SOCKET_H__
 
 #include "MessageBuffer.h"
-#include "Log.h"
-#include <atomic>
-#include <vector>
-#include <mutex>
-#include <queue>
-#include <memory>
-#include <functional>
-#include <type_traits>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/write.hpp>
-#include <boost/asio/read.hpp>
-
-using boost::asio::ip::tcp;
+#include <uv.h>
 
 #define READ_BLOCK_SIZE 4096
-#ifdef BOOST_ASIO_HAS_IOCP
-#define TC_SOCKET_USE_IOCP
-#endif
+#include "SocketMgr.h"
+
 
 template<class T>
-class Socket : public std::enable_shared_from_this<T>
+class Socket
 {
 public:
-    explicit Socket(tcp::socket&& socket) : _socket(std::move(socket)), _remoteAddress(_socket.remote_endpoint().address()),
-        _remotePort(_socket.remote_endpoint().port()), _readBuffer(), _closed(false), _closing(false), _isWritingAsync(false)
+    explicit Socket(uv_tcp_t* socket, SocketMgr<T>* socketMgr) : _socket(socket), _readBuffer(), _socketMgr(socketMgr)
     {
         _readBuffer.Resize(READ_BLOCK_SIZE);
+
+        struct sockaddr_in name;
+        int namelen = sizeof(name);
+        uv_tcp_getpeername(_socket, reinterpret_cast<struct sockaddr*>(&name), &namelen);
+
+        _remotePort = name.sin_port;
+
+        char addr[16];
+        uv_inet_ntop(AF_INET, &name.sin_addr, addr, sizeof(addr));
+        _remoteAddress = std::string(addr);
+
+        _socket->data = static_cast<void*>(this);
     }
 
     virtual ~Socket()
     {
-        boost::system::error_code error;
-        _socket.close(error);
+        CloseSocket();
+
+        delete _socket;
     }
 
     virtual void Start() = 0;
 
-    virtual bool Update()
-    {
-        if (!IsOpen())
-            return false;
+    const std::string& GetRemoteIpAddress() const { return _remoteAddress; }
 
-#ifndef TC_SOCKET_USE_IOCP
-        std::unique_lock<std::mutex> guard(_writeLock);
-        if (!guard)
-            return true;
+    uint16 GetRemotePort() const { return _remotePort; }
 
-        if (_isWritingAsync || (!_writeBuffer.GetActiveSize() && _writeQueue.empty()))
-            return true;
-
-        for (; WriteHandler(guard);)
-            ;
-#endif
-
-        return true;
-    }
-
-    boost::asio::ip::address GetRemoteIpAddress() const
-    {
-        return _remoteAddress;
-    }
-
-    uint16 GetRemotePort() const
-    {
-        return _remotePort;
-    }
-
-    void AsyncRead()
+    void SendPacket(MessageBuffer* buffer)
     {
         if (!IsOpen())
             return;
 
-        _readBuffer.Normalize();
-        _readBuffer.EnsureFreeSpace();
-        _socket.async_read_some(boost::asio::buffer(_readBuffer.GetWritePointer(), _readBuffer.GetRemainingSpace()),
-            std::bind(&Socket<T>::ReadHandlerInternal, this->shared_from_this(), std::placeholders::_1, std::placeholders::_2));
-    }
+        uv_buf_t bufs[] = { uv_buf_t() };
 
-    void ReadData(std::size_t size)
-    {
-        if (!IsOpen())
-            return;
+        bufs[0].base = reinterpret_cast<char*>(buffer->GetReadPointer());
+        bufs[0].len = static_cast<size_t>(buffer->GetBufferSize());
 
-        boost::system::error_code error;
+        auto request = new uv_write_t();
 
-        std::size_t bytesRead = boost::asio::read(_socket, boost::asio::buffer(_readBuffer.GetWritePointer(), size), error);
+        request->data = static_cast<void*>(buffer);
 
-        _readBuffer.WriteCompleted(bytesRead);
-
-        if (error || bytesRead != size)
+        int writeStatus = _socketMgr->QueueWriteRequest(request, reinterpret_cast<uv_stream_t*>(_socket), bufs, 1, [](uv_write_t* req, int status)
         {
-            TC_LOG_DEBUG("network", "Socket::ReadData: %s errored with: %i (%s)", GetRemoteIpAddress().to_string().c_str(), error.value(),
-                error.message().c_str());
+            if (status > 0)
+            {
+                TC_LOG_ERROR("network", "Socket::SendPacket callback failed. (%s)", uv_strerror(status));
+                auto socket = static_cast<Socket<T>*>(req->handle->data);
+                socket->CloseSocket();
+                return;
+            }
 
+            delete static_cast<MessageBuffer*>(req->data);
+            delete req;
+        });
+
+        if (writeStatus > 0)
+        {
+            TC_LOG_ERROR("network", "Socket::SendPacket write failed. (%s)", uv_strerror(writeStatus));
             CloseSocket();
         }
     }
 
-    void QueuePacket(MessageBuffer&& buffer, std::unique_lock<std::mutex>& guard)
+    void AsyncRead()
     {
-        _writeQueue.push(std::move(buffer));
+        int status = uv_read_start(reinterpret_cast<uv_stream_t*>(_socket),
+            [](uv_handle_t* uvSocket, size_t /*suggestedSize*/, uv_buf_t* buffer){
 
-#ifdef TC_SOCKET_USE_IOCP
-        AsyncProcessQueue(guard);
-#else
-        (void)guard;
-#endif
+            auto socket = static_cast<Socket<T>*>(uvSocket->data);
+
+            socket->GetReadBuffer().Normalize();
+            socket->GetReadBuffer().EnsureFreeSpace();
+
+            buffer->base = reinterpret_cast<char*>(socket->GetReadBuffer().GetWritePointer());
+            buffer->len = socket->GetReadBuffer().GetRemainingSpace();
+        },
+            [](uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf){
+
+            auto socket = static_cast<Socket<T>*>(stream->data);
+
+            socket->GetReadBuffer().WriteCompleted(nread);
+
+            socket->ReadHandler();
+        });
+
+        if (status > 0)
+        {
+            TC_LOG_ERROR("network", "Socket::AsyncRead failed. (%s)", uv_strerror(status));
+            CloseSocket();
+        }
     }
 
-    bool IsOpen() const { return !_closed && !_closing; }
+    bool IsOpen() const { return !uv_is_closing(reinterpret_cast<uv_handle_t*>(_socket)) || !uv_is_writable(reinterpret_cast<uv_stream_t*>(_socket)); }
 
     void CloseSocket()
     {
-        if (_closed.exchange(true))
-            return;
+        if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(_socket)))
+        {
+            uv_close(reinterpret_cast<uv_handle_t*>(_socket), nullptr);
 
-        boost::system::error_code shutdownError;
-        _socket.shutdown(boost::asio::socket_base::shutdown_send, shutdownError);
-        if (shutdownError)
-            TC_LOG_DEBUG("network", "Socket::CloseSocket: %s errored when shutting down socket: %i (%s)", GetRemoteIpAddress().to_string().c_str(),
-                shutdownError.value(), shutdownError.message().c_str());
-
-        OnClose();
+            OnClose();
+        }
     }
 
-    /// Marks the socket for closing after write buffer becomes empty
-    void DelayedCloseSocket() { _closing = true; }
+    void DelayedCloseSocket()
+    {
+        uv_shutdown(new uv_shutdown_t, reinterpret_cast<uv_stream_t*>(_socket), [](uv_shutdown_t* request, int status)
+        {
+            if (status > 0)
+            {
+                TC_LOG_ERROR("network", "Socket::DelayedCloseSocket shutdown callback error (%s)", uv_strerror(status));
+            }
+            
+            auto socket = static_cast<Socket<T>*>(request->handle->data);
+
+            socket->CloseSocket();
+
+            delete request;
+        });
+    }
 
     MessageBuffer& GetReadBuffer() { return _readBuffer; }
 
@@ -154,158 +159,17 @@ protected:
 
     virtual void ReadHandler() = 0;
 
-    bool AsyncProcessQueue(std::unique_lock<std::mutex>&)
-    {
-        if (_isWritingAsync)
-            return false;
-
-        _isWritingAsync = true;
-
-#ifdef TC_SOCKET_USE_IOCP
-        MessageBuffer& buffer = _writeQueue.front();
-        _socket.async_write_some(boost::asio::buffer(buffer.GetReadPointer(), buffer.GetActiveSize()), std::bind(&Socket<T>::WriteHandler,
-            this->shared_from_this(), std::placeholders::_1, std::placeholders::_2));
-#else
-        _socket.async_write_some(boost::asio::null_buffers(), std::bind(&Socket<T>::WriteHandlerWrapper,
-            this->shared_from_this(), std::placeholders::_1, std::placeholders::_2));
-#endif
-
-        return false;
-    }
-
-    std::mutex _writeLock;
-    std::queue<MessageBuffer> _writeQueue;
-#ifndef TC_SOCKET_USE_IOCP
-    MessageBuffer _writeBuffer;
-#endif
-
 private:
-    void ReadHandlerInternal(boost::system::error_code error, size_t transferredBytes)
-    {
-        if (error)
-        {
-            CloseSocket();
-            return;
-        }
 
-        _readBuffer.WriteCompleted(transferredBytes);
-        ReadHandler();
-    }
+    std::string _remoteAddress;
 
-#ifdef TC_SOCKET_USE_IOCP
+    uv_tcp_t *_socket;
 
-    void WriteHandler(boost::system::error_code error, std::size_t transferedBytes)
-    {
-        if (!error)
-        {
-            std::unique_lock<std::mutex> deleteGuard(_writeLock);
-
-            _isWritingAsync = false;
-            _writeQueue.front().ReadCompleted(transferedBytes);
-            if (!_writeQueue.front().GetActiveSize())
-                _writeQueue.pop();
-
-            if (!_writeQueue.empty())
-                AsyncProcessQueue(deleteGuard);
-            else if (_closing)
-                CloseSocket();
-        }
-        else
-            CloseSocket();
-    }
-
-#else
-
-    void WriteHandlerWrapper(boost::system::error_code /*error*/, std::size_t /*transferedBytes*/)
-    {
-        std::unique_lock<std::mutex> guard(_writeLock);
-        _isWritingAsync = false;
-        WriteHandler(guard);
-    }
-
-    bool WriteHandler(std::unique_lock<std::mutex>& guard)
-    {
-        if (!IsOpen())
-            return false;
-
-        std::size_t bytesToSend = _writeBuffer.GetActiveSize();
-
-        if (bytesToSend == 0)
-            return HandleQueue(guard);
-
-        boost::system::error_code error;
-        std::size_t bytesWritten = _socket.write_some(boost::asio::buffer(_writeBuffer.GetReadPointer(), bytesToSend), error);
-
-        if (error)
-        {
-            if (error == boost::asio::error::would_block || error == boost::asio::error::try_again)
-                return AsyncProcessQueue(guard);
-
-            return false;
-        }
-        else if (bytesWritten == 0)
-            return false;
-        else if (bytesWritten < bytesToSend)
-        {
-            _writeBuffer.ReadCompleted(bytesWritten);
-            _writeBuffer.Normalize();
-            return AsyncProcessQueue(guard);
-        }
-
-        // now bytesWritten == bytesToSend
-        _writeBuffer.Reset();
-
-        return HandleQueue(guard);
-    }
-
-    bool HandleQueue(std::unique_lock<std::mutex>& guard)
-    {
-        if (_writeQueue.empty())
-            return false;
-
-        MessageBuffer& queuedMessage = _writeQueue.front();
-
-        std::size_t bytesToSend = queuedMessage.GetActiveSize();
-
-        boost::system::error_code error;
-        std::size_t bytesSent = _socket.write_some(boost::asio::buffer(queuedMessage.GetReadPointer(), bytesToSend), error);
-
-        if (error)
-        {
-            if (error == boost::asio::error::would_block || error == boost::asio::error::try_again)
-                return AsyncProcessQueue(guard);
-
-            _writeQueue.pop();
-            return false;
-        }
-        else if (bytesSent == 0)
-        {
-            _writeQueue.pop();
-            return false;
-        }
-        else if (bytesSent < bytesToSend) // now n > 0
-        {
-            queuedMessage.ReadCompleted(bytesSent);
-            return AsyncProcessQueue(guard);
-        }
-
-        _writeQueue.pop();
-        return !_writeQueue.empty();
-    }
-
-#endif
-
-    tcp::socket _socket;
-
-    boost::asio::ip::address _remoteAddress;
     uint16 _remotePort;
 
     MessageBuffer _readBuffer;
 
-    std::atomic<bool> _closed;
-    std::atomic<bool> _closing;
-
-    bool _isWritingAsync;
+    SocketMgr<T>* _socketMgr;
 };
 
 #endif // __SOCKET_H__

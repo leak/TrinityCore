@@ -38,6 +38,7 @@
 #include <boost/program_options.hpp>
 #include <openssl/opensslv.h>
 #include <openssl/crypto.h>
+#include <boost/asio/signal_set.hpp>
 
 using boost::asio::ip::tcp;
 using namespace boost::program_options;
@@ -116,7 +117,7 @@ int main(int argc, char** argv)
 
     std::string bindIp = sConfigMgr->GetStringDefault("BindIP", "0.0.0.0");
 
-    sAuthSocketMgr.StartNetwork(_ioService, bindIp, port);
+    sAuthSocketMgr.StartNetwork(bindIp, port);
 
     // Set signal handlers
     boost::asio::signal_set signals(_ioService, SIGINT, SIGTERM);

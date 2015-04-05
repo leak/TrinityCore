@@ -28,7 +28,6 @@
 
 #include "Common.h"
 #include "DatabaseEnv.h"
-#include "AsyncAcceptor.h"
 #include "RASession.h"
 #include "Configuration/Config.h"
 #include "OpenSSLCrypto.h"
@@ -48,6 +47,7 @@
 #include "WorldSocket.h"
 #include "WorldSocketMgr.h"
 #include "DatabaseLoader.h"
+#include <boost/asio/signal_set.hpp>
 
 using namespace boost::program_options;
 
@@ -84,7 +84,7 @@ uint32 realmID;                                             ///< Id of the realm
 
 void SignalHandler(const boost::system::error_code& error, int signalNumber);
 void FreezeDetectorHandler(const boost::system::error_code& error);
-AsyncAcceptor* StartRaSocketAcceptor(boost::asio::io_service& ioService);
+//AsyncAcceptor* StartRaSocketAcceptor(boost::asio::io_service& ioService);
 bool StartDB();
 void StopDB();
 void WorldUpdateLoop();
@@ -205,10 +205,11 @@ extern int main(int argc, char** argv)
         cliThread = new std::thread(CliThread);
     }
 
+    // TODO: Reimplement
     // Start the Remote Access port (acceptor) if enabled
-    AsyncAcceptor* raAcceptor = nullptr;
-    if (sConfigMgr->GetBoolDefault("Ra.Enable", false))
-        raAcceptor = StartRaSocketAcceptor(_ioService);
+//    AsyncAcceptor* raAcceptor = nullptr;
+//    if (sConfigMgr->GetBoolDefault("Ra.Enable", false))
+//        raAcceptor = StartRaSocketAcceptor(_ioService);
 
     // Start soap serving thread if enabled
     std::thread* soapThread = nullptr;
@@ -221,7 +222,7 @@ extern int main(int argc, char** argv)
     uint16 worldPort = uint16(sWorld->getIntConfig(CONFIG_PORT_WORLD));
     std::string worldListener = sConfigMgr->GetStringDefault("BindIP", "0.0.0.0");
 
-    sWorldSocketMgr.StartNetwork(_ioService, worldListener, worldPort);
+    sWorldSocketMgr.StartNetwork(worldListener, worldPort);
 
     // Set server online (allow connecting now)
     LoginDatabase.DirectPExecute("UPDATE realmlist SET flag = flag & ~%u, population = 0 WHERE id = '%u'", REALM_FLAG_INVALID, realmID);
@@ -270,7 +271,7 @@ extern int main(int argc, char** argv)
         delete soapThread;
     }
 
-    delete raAcceptor;
+    //delete raAcceptor;
 
     ///- Clean database before leaving
     ClearOnlineAccounts();
@@ -433,15 +434,15 @@ void FreezeDetectorHandler(const boost::system::error_code& error)
     }
 }
 
-AsyncAcceptor* StartRaSocketAcceptor(boost::asio::io_service& ioService)
-{
-    uint16 raPort = uint16(sConfigMgr->GetIntDefault("Ra.Port", 3443));
-    std::string raListener = sConfigMgr->GetStringDefault("Ra.IP", "0.0.0.0");
-
-    AsyncAcceptor* acceptor = new AsyncAcceptor(ioService, raListener, raPort);
-    acceptor->AsyncAccept<RASession>();
-    return acceptor;
-}
+//AsyncAcceptor* StartRaSocketAcceptor(boost::asio::io_service& ioService)
+//{
+//    uint16 raPort = uint16(sConfigMgr->GetIntDefault("Ra.Port", 3443));
+//    std::string raListener = sConfigMgr->GetStringDefault("Ra.IP", "0.0.0.0");
+//
+//    AsyncAcceptor* acceptor = new AsyncAcceptor(ioService, raListener, raPort);
+//    acceptor->AsyncAccept<RASession>();
+//    return acceptor;
+//}
 
 /// Initialize connection to the databases
 bool StartDB()
