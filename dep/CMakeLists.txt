@@ -37,6 +37,7 @@ endif()
 if(SERVERS)
   add_subdirectory(cppformat)
   add_subdirectory(gsoap)
+  add_subdirectory(libuv)
 endif()
 
 if(TOOLS)
